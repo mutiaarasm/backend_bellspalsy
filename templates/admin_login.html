@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login Admin - Bell's Palsy</title>
+
+    <!-- Google Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: 'Poppins', sans-serif;
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .login-wrapper {
+            width: 100%;
+            max-width: 980px;
+            min-height: 560px;
+            background: rgba(255, 255, 255, 0.96);
+            border-radius: 28px;
+            overflow: hidden;
+            display: grid;
+            grid-template-columns: 1.1fr 0.9fr;
+            box-shadow: 0 25px 70px rgba(0, 0, 0, 0.18);
+        }
+
+        .left-panel {
+            padding: 50px;
+            background: linear-gradient(135deg, #eaf7ff, #ffffff);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 35px;
+        }
+
+        .brand-icon {
+            width: 52px;
+            height: 52px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #4facfe, #00f2fe);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 26px;
+            box-shadow: 0 10px 25px rgba(79, 172, 254, 0.35);
+        }
+
+        .brand-text h1 {
+            margin: 0;
+            font-size: 22px;
+            color: #1f2937;
+            font-weight: 700;
+        }
+
+        .brand-text p {
+            margin: 3px 0 0;
+            font-size: 13px;
+            color: #6b7280;
+        }
+
+        .headline {
+            font-size: 34px;
+            line-height: 1.25;
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 16px;
+        }
+
+        .description {
+            font-size: 15px;
+            color: #6b7280;
+            line-height: 1.8;
+            max-width: 430px;
+        }
+
+        .features {
+            margin-top: 35px;
+            display: grid;
+            gap: 14px;
+        }
+
+        .feature-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: #374151;
+            font-size: 14px;
+        }
+
+        .check {
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            background: #dff7ef;
+            color: #059669;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 14px;
+        }
+
+        .right-panel {
+            padding: 50px 45px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            background: #ffffff;
+        }
+
+        .login-title {
+            font-size: 26px;
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 8px;
+        }
+
+        .login-subtitle {
+            color: #6b7280;
+            font-size: 14px;
+            margin-bottom: 28px;
+        }
+
+        .error-box {
+            background: #fee2e2;
+            color: #991b1b;
+            padding: 12px 14px;
+            border-radius: 12px;
+            font-size: 14px;
+            margin-bottom: 20px;
+            border: 1px solid #fecaca;
+        }
+
+        .form-group {
+            margin-bottom: 18px;
+        }
+
+        label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            color: #374151;
+            margin-bottom: 8px;
+        }
+
+        .input-field {
+            width: 100%;
+            border: 1px solid #d1d5db;
+            border-radius: 14px;
+            padding: 13px 15px;
+            font-size: 14px;
+            font-family: 'Poppins', sans-serif;
+            outline: none;
+            transition: 0.25s;
+            background: #f9fafb;
+        }
+
+        .input-field:focus {
+            background: #ffffff;
+            border-color: #4facfe;
+            box-shadow: 0 0 0 4px rgba(79, 172, 254, 0.14);
+        }
+
+        .password-wrap {
+            position: relative;
+        }
+
+        .toggle-password {
+            position: absolute;
+            right: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            border: none;
+            background: none;
+            color: #2563eb;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .login-btn {
+            width: 100%;
+            margin-top: 10px;
+            border: none;
+            border-radius: 14px;
+            padding: 14px;
+            font-family: 'Poppins', sans-serif;
+            font-size: 15px;
+            font-weight: 600;
+            color: #ffffff;
+            cursor: pointer;
+            background: linear-gradient(135deg, #4facfe, #00c6ff);
+            box-shadow: 0 12px 25px rgba(79, 172, 254, 0.35);
+            transition: 0.25s;
+        }
+
+        .login-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 16px 30px rgba(79, 172, 254, 0.45);
+        }
+
+        .security-note {
+            margin-top: 24px;
+            padding: 13px 15px;
+            border-radius: 14px;
+            background: #f3f8ff;
+            color: #4b5563;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .footer-text {
+            margin-top: 24px;
+            text-align: center;
+            color: #9ca3af;
+            font-size: 12px;
+        }
+
+        @media (max-width: 850px) {
+            .login-wrapper {
+                grid-template-columns: 1fr;
+                max-width: 460px;
+            }
+
+            .left-panel {
+                display: none;
+            }
+
+            .right-panel {
+                padding: 36px 28px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="login-wrapper">
+
+    <div class="left-panel">
+        <div class="brand">
+            <div class="brand-icon">🧠</div>
+            <div class="brand-text">
+                <h1>Bell's Palsy</h1>
+                <p>Admin Management System</p>
+            </div>
+        </div>
+
+        <div class="headline">
+            Kelola konten aplikasi dengan aman dan terstruktur.
+        </div>
+
+        <div class="description">
+            Halaman ini digunakan khusus oleh admin untuk mengelola artikel edukasi,
+            video latihan terapi, dan data pendukung aplikasi Bell's Palsy.
+        </div>
+
+        <div class="features">
+            <div class="feature-item">
+                <div class="check">✓</div>
+                <span>Manajemen artikel edukasi</span>
+            </div>
+            <div class="feature-item">
+                <div class="check">✓</div>
+                <span>Pengelolaan video latihan wajah</span>
+            </div>
+            <div class="feature-item">
+                <div class="check">✓</div>
+                <span>Akses admin lebih terlindungi</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="right-panel">
+        <div class="login-title">Login Admin</div>
+        <div class="login-subtitle">
+            Masukkan akun admin untuk melanjutkan ke dashboard.
+        </div>
+
+        {% if error %}
+            <div class="error-box">
+                {{ error }}
+            </div>
+        {% endif %}
+
+        <form method="POST">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" class="input-field" placeholder="Masukkan username" required>
+            </div>
+
+            <div class="form-group">
+                <label>Password</label>
+                <div class="password-wrap">
+                    <input type="password" name="password" id="password" class="input-field" placeholder="Masukkan password" required>
+                    <button type="button" class="toggle-password" onclick="togglePassword()">Lihat</button>
+                </div>
+            </div>
+
+            <button type="submit" class="login-btn">
+                Masuk ke Dashboard
+            </button>
+        </form>
+
+        <div class="security-note">
+            🔒 Akses halaman ini hanya untuk admin. Jangan membagikan username dan password kepada pihak lain.
+        </div>
+
+        <div class="footer-text">
+            © 2026 Bell's Palsy Admin Panel
+        </div>
+    </div>
+
+</div>
+
+<script>
+    function togglePassword() {
+        const password = document.getElementById("password");
+        const button = document.querySelector(".toggle-password");
+
+        if (password.type === "password") {
+            password.type = "text";
+            button.textContent = "Sembunyi";
+        } else {
+            password.type = "password";
+            button.textContent = "Lihat";
+        }
+    }
+</script>
+
+</body>
+</html>
