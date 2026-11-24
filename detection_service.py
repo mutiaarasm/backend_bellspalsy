@@ -1,196 +1,874 @@
-import base64
-from datetime import datetime
-import math
-import cv2
-import numpy as np
-import mediapipe as mp
-from models import db, UserProgress
+from __future__ import annotations
 
+import base64
+from pathlib import Path
+from statistics import median
+from typing import Any
+
+import cv2
+import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+from geometry_utils import (
+    asymmetry_index,
+    euclidean_distance,
+    line_angle_degrees,
+    line_slope,
+    mean_point,
+    isotropic_normalize_landmarks,
+    normalize_line_angle,
+    remove_head_roll,
+    weaker_side,
+)
+
+from hb_rules import classify_house_brackmann
+from regional_assessment import (
+    REGIONAL_ASSESSMENT_VERSION,
+    assess_regions,
+    calculate_face_function_score,
+    infer_affected_side,
+)
 
 
-MODEL_PATH = "models/face_landmarker.task"
+# ============================================================
+# KONFIGURASI DASAR
+# ============================================================
 
-LEFT_EYE_TOP = 159
-LEFT_EYE_BOTTOM = 145
-RIGHT_EYE_TOP = 386
-RIGHT_EYE_BOTTOM = 374
+EPSILON = 1e-8
 
-LEFT_EYEBROW = 105
-RIGHT_EYEBROW = 334
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "models" / "face_landmarker.task"
 
-LEFT_MOUTH = 61
-RIGHT_MOUTH = 291
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(
+        f"Model MediaPipe tidak ditemukan: {MODEL_PATH}"
+    )
 
 
-base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+# ============================================================
+# LANDMARK MATA DAN ALIS
+# ============================================================
+
+RIGHT_EYE_POINTS = (33, 133, 159, 145)
+LEFT_EYE_POINTS = (362, 263, 386, 374)
+
+RIGHT_BROW_POINTS = (70, 63, 105, 66, 107)
+LEFT_BROW_POINTS = (336, 296, 334, 293, 300)
+
+RIGHT_EYE_VERTICAL_PAIRS = (
+    (159, 145),
+    (158, 153),
+    (160, 144),
+)
+
+LEFT_EYE_VERTICAL_PAIRS = (
+    (386, 374),
+    (385, 380),
+    (387, 373),
+)
+
+RIGHT_EYE_HORIZONTAL = (33, 133)
+LEFT_EYE_HORIZONTAL = (362, 263)
+
+
+# ============================================================
+# LANDMARK MULUT
+# ============================================================
+
+# Beberapa landmark dipakai sebagai satu kelompok agar hasil lebih stabil
+# daripada hanya bergantung pada satu landmark di setiap sisi.
+MOUTH_CORNER_GROUPS = (
+    (61, 146, 185),
+    (291, 375, 409),
+)
+
+# Kelompok sisi bibir atas untuk gerakan snarl.
+UPPER_LIP_SIDE_GROUPS = (
+    (37, 39, 40),
+    (267, 269, 270),
+)
+
+
+# ============================================================
+# PROTOKOL GERAKAN DAN QUALITY GATE
+# ============================================================
+
+REQUIRED_MOVEMENTS = (
+    "diam",
+    "angkat_alis",
+    "tutup_mata",
+    "senyum",
+    "mencucu",
+)
+
+MINIMUM_VALID_FRAMES = 4
+MAXIMUM_FRAMES_PER_MOVEMENT = 6
+
+# Threshold ini hanya memeriksa apakah gerakan dilakukan atau tidak.
+# Nilainya merupakan threshold kualitas pilot, bukan threshold klinis.
+# MIN_SNARL_MAX_EXCURSION = 0.015
+MIN_PUCKER_MAX_EXCURSION = 0.015
+MIN_PUCKER_WIDTH_REDUCTION = 0.05
+
+
+# ============================================================
+# MEDIAPIPE FACE LANDMARKER
+# ============================================================
+
+base_options = python.BaseOptions(
+    model_asset_path=str(MODEL_PATH),
+)
 
 options = vision.FaceLandmarkerOptions(
     base_options=base_options,
     running_mode=vision.RunningMode.IMAGE,
-    num_faces=1,
+    # Mengizinkan maksimal dua wajah agar backend dapat menolak frame
+    # yang berisi lebih dari satu wajah.
+    num_faces=2,
+    min_face_detection_confidence=0.7,
+    min_face_presence_confidence=0.7,
 )
 
 landmarker = vision.FaceLandmarker.create_from_options(options)
 
 
+# ============================================================
+# UTILITAS GAMBAR DAN LANDMARK
+# ============================================================
 
-def analyze_detection_frames(frames):
-    result = {}
-
-    for movement, frame_list in frames.items():
-        features_list = []
-
-        for frame_base64 in frame_list:
-            image = decode_base64_image(frame_base64)
-
-            if image is None:
-                continue
-
-            features = analyze_single_frame(image)
-
-            if features is not None:
-                features_list.append(features)
-
-        if len(features_list) == 0:
-            result[movement] = {
-                "mata": 0,
-                "alis": 0,
-                "mulut": 0,
-            }
-        else:
-            result[movement] = aggregate_features(features_list)
-
-    return result
-
-
-def decode_base64_image(base64_string):
+def decode_base64_image(base64_string: str) -> np.ndarray | None:
     try:
-        if "," in base64_string:
-            base64_string = base64_string.split(",")[1]
-
-        image_bytes = base64.b64decode(base64_string)
-        np_arr = np.frombuffer(image_bytes, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-        return image
-    except Exception as e:
-        print("Decode image error:", e)
-        return None
-
-
-def analyze_single_frame(image_bgr):
-    try:
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=image_rgb,
-        )
-
-        detection_result = landmarker.detect(mp_image)
-
-        if not detection_result.face_landmarks:
+        if not isinstance(base64_string, str):
             return None
 
-        landmarks = detection_result.face_landmarks[0]
+        if "," in base64_string:
+            base64_string = base64_string.split(",", maxsplit=1)[1]
 
-        normalized = normalize_landmarks(landmarks)
-
-        f_mata = calculate_eye_asymmetry(normalized)
-        f_alis = calculate_angle_asymmetry(
-            normalized[RIGHT_EYEBROW],
-            normalized[LEFT_EYEBROW],
-        )
-        f_mulut = calculate_angle_asymmetry(
-            normalized[RIGHT_MOUTH],
-            normalized[LEFT_MOUTH],
+        image_bytes = base64.b64decode(
+            base64_string,
+            validate=True,
         )
 
-        return {
-            "mata": f_mata,
-            "alis": f_alis,
-            "mulut": f_mulut,
-        }
+        image_array = np.frombuffer(
+            image_bytes,
+            dtype=np.uint8,
+        )
 
-    except Exception as e:
-        print("Analyze frame error:", e)
+        return cv2.imdecode(
+            image_array,
+            cv2.IMREAD_COLOR,
+        )
+
+    except Exception as error:
+        print("DECODE IMAGE ERROR:", error)
         return None
 
 
-def normalize_landmarks(landmarks):
-    xs = [lm.x for lm in landmarks]
-    ys = [lm.y for lm in landmarks]
+def detect_landmarks(image_bgr: np.ndarray) -> list[Any] | None:
+    if image_bgr is None:
+        return None
 
-    x_min = min(xs)
-    x_max = max(xs)
-    y_min = min(ys)
-    y_max = max(ys)
-
-    normalized = []
-
-    for lm in landmarks:
-        x_new = (lm.x - x_min) / (x_max - x_min)
-        y_new = (lm.y - y_min) / (y_max - y_min)
-        normalized.append((x_new, y_new))
-
-    return normalized
-
-
-def euclidean_distance(p1, p2):
-    x1, y1 = p1
-    x2, y2 = p2
-
-    return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-
-
-def calculate_eye_asymmetry(landmarks):
-    d_left = euclidean_distance(
-        landmarks[LEFT_EYE_TOP],
-        landmarks[LEFT_EYE_BOTTOM],
+    image_rgb = cv2.cvtColor(
+        image_bgr,
+        cv2.COLOR_BGR2RGB,
     )
 
-    d_right = euclidean_distance(
-        landmarks[RIGHT_EYE_TOP],
-        landmarks[RIGHT_EYE_BOTTOM],
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=image_rgb,
     )
 
-    return abs(d_left - d_right)
+    detection_result = landmarker.detect(mp_image)
+
+    # Frame hanya diterima jika tepat satu wajah terdeteksi.
+    if len(detection_result.face_landmarks) != 1:
+        return None
+
+    return detection_result.face_landmarks[0]
 
 
-def calculate_angle_asymmetry(point_right, point_left):
-    x1, y1 = point_right
-    x2, y2 = point_left
+def eye_aperture_ratio(
+    points: np.ndarray,
+    vertical_pairs: tuple[tuple[int, int], ...],
+    horizontal_pair: tuple[int, int],
+) -> float:
+    vertical_distances = [
+        euclidean_distance(
+            points[top_index],
+            points[bottom_index],
+        )
+        for top_index, bottom_index in vertical_pairs
+    ]
 
-    delta_y = abs(y2 - y1)
-    delta_x = abs(x2 - x1)
+    mean_vertical = float(np.mean(vertical_distances))
 
-    if delta_x == 0:
-        return 0
+    horizontal_distance = euclidean_distance(
+        points[horizontal_pair[0]],
+        points[horizontal_pair[1]],
+    )
 
-    angle = math.degrees(math.atan(delta_y / delta_x))
+    return mean_vertical / (horizontal_distance + EPSILON)
 
-    return angle
 
-def aggregate_features(features_list):
-    return {
-        "mata": max(item["mata"] for item in features_list),
-        "alis": max(item["alis"] for item in features_list),
-        "mulut": max(item["mulut"] for item in features_list),
-    }
-def save_user_progress(user_id, session_number):
-    try:
-        progress = UserProgress(
-            user_id=user_id,
-            session_number=session_number,
-            completed_at=datetime.utcnow()
+def ordered_group_centers(
+    points: np.ndarray,
+    group_a: tuple[int, ...],
+    group_b: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Mengambil rata-rata beberapa landmark lalu mengurutkannya
+    sebagai sisi kiri dan kanan gambar berdasarkan koordinat x.
+    """
+    center_a = mean_point(points, group_a)
+    center_b = mean_point(points, group_b)
+
+    centers = [center_a, center_b]
+    centers.sort(key=lambda point: float(point[0]))
+
+    return centers[0], centers[1]
+
+
+# ============================================================
+# EKSTRAKSI GEOMETRI SATU FRAME
+# ============================================================
+
+def extract_frame_geometry(
+    landmarks: list[Any],
+    image_shape: tuple[int, ...],
+) -> dict[str, float]:
+    image_height, image_width = image_shape[:2]
+
+    # Sudut dihitung dari koordinat piksel supaya rasio aspek gambar
+    # tidak mengubah hasil angle.
+    raw_points = np.array(
+        [
+            [
+                landmark.x * image_width,
+                landmark.y * image_height,
+            ]
+            for landmark in landmarks
+        ],
+        dtype=np.float64,
+    )
+
+    groups = [
+        {
+            "eye_points": RIGHT_EYE_POINTS,
+            "brow_points": RIGHT_BROW_POINTS,
+            "vertical_pairs": RIGHT_EYE_VERTICAL_PAIRS,
+            "horizontal_pair": RIGHT_EYE_HORIZONTAL,
+        },
+        {
+            "eye_points": LEFT_EYE_POINTS,
+            "brow_points": LEFT_BROW_POINTS,
+            "vertical_pairs": LEFT_EYE_VERTICAL_PAIRS,
+            "horizontal_pair": LEFT_EYE_HORIZONTAL,
+        },
+    ]
+
+    for group in groups:
+        group["raw_eye_center"] = mean_point(
+            raw_points,
+            group["eye_points"],
         )
 
-        db.session.add(progress)
-        db.session.commit()
+    # left/right pada backend berarti kiri/kanan gambar.
+    groups.sort(
+        key=lambda group: float(group["raw_eye_center"][0])
+    )
 
-    except Exception as e:
-        db.session.rollback()
-        print("SAVE PROGRESS ERROR:", e)
+    image_left_group = groups[0]
+    image_right_group = groups[1]
+
+    rotated_points, head_roll = remove_head_roll(
+        raw_points,
+        image_left_group["raw_eye_center"],
+        image_right_group["raw_eye_center"],
+    )
+
+    if abs(head_roll) > 20.0:
+        raise ValueError("pose_rejected")
+
+    # Normalisasi dilakukan setelah koreksi head-roll menggunakan jarak
+    # antar-mata sebagai satu skala fisik yang konsisten. Min-max scaling
+    # berdasarkan bounding box tiap frame dapat berubah ketika mulut/alis
+    # bergerak dan membuat excursion ikut berubah secara artifisial.
+    rotated_left_eye_center = mean_point(
+        rotated_points,
+        image_left_group["eye_points"],
+    )
+    rotated_right_eye_center = mean_point(
+        rotated_points,
+        image_right_group["eye_points"],
+    )
+
+    scaled_points = isotropic_normalize_landmarks(
+        rotated_points,
+        rotated_left_eye_center,
+        rotated_right_eye_center,
+    )
+
+    left_eye_center = mean_point(
+        scaled_points,
+        image_left_group["eye_points"],
+    )
+    right_eye_center = mean_point(
+        scaled_points,
+        image_right_group["eye_points"],
+    )
+
+    left_brow_center = mean_point(
+        scaled_points,
+        image_left_group["brow_points"],
+    )
+    right_brow_center = mean_point(
+        scaled_points,
+        image_right_group["brow_points"],
+    )
+
+    left_eye_aperture = eye_aperture_ratio(
+        scaled_points,
+        image_left_group["vertical_pairs"],
+        image_left_group["horizontal_pair"],
+    )
+    right_eye_aperture = eye_aperture_ratio(
+        scaled_points,
+        image_right_group["vertical_pairs"],
+        image_right_group["horizontal_pair"],
+    )
+
+    left_brow_eye_distance = euclidean_distance(
+        left_brow_center,
+        left_eye_center,
+    )
+    right_brow_eye_distance = euclidean_distance(
+        right_brow_center,
+        right_eye_center,
+    )
+
+    # Kelompok sudut bibir pada koordinat hasil Min-Max.
+    mouth_left, mouth_right = ordered_group_centers(
+        scaled_points,
+        MOUTH_CORNER_GROUPS[0],
+        MOUTH_CORNER_GROUPS[1],
+    )
+
+    # Kelompok sudut bibir pada koordinat piksel yang telah dikoreksi roll.
+    raw_mouth_left, raw_mouth_right = ordered_group_centers(
+        rotated_points,
+        MOUTH_CORNER_GROUPS[0],
+        MOUTH_CORNER_GROUPS[1],
+    )
+
+    mouth_width = euclidean_distance(
+        mouth_left,
+        mouth_right,
+    )
+
+    mouth_angle = normalize_line_angle(
+        line_angle_degrees(
+            raw_mouth_left,
+            raw_mouth_right,
+        )
+    )
+
+    mouth_slope = line_slope(
+        raw_mouth_left,
+        raw_mouth_right,
+    )
+
+    rotated_left_brow = mean_point(
+        rotated_points,
+        image_left_group["brow_points"],
+    )
+    rotated_right_brow = mean_point(
+        rotated_points,
+        image_right_group["brow_points"],
+    )
+
+    brow_angle = normalize_line_angle(
+        line_angle_degrees(
+            rotated_left_brow,
+            rotated_right_brow,
+        )
+    )
+
+    upper_left, upper_right = ordered_group_centers(
+        scaled_points,
+        UPPER_LIP_SIDE_GROUPS[0],
+        UPPER_LIP_SIDE_GROUPS[1],
+    )
+
+    return {
+        "head_roll_deg": float(head_roll),
+
+        "left_eye_aperture": float(left_eye_aperture),
+        "right_eye_aperture": float(right_eye_aperture),
+
+        "left_brow_eye_distance": float(left_brow_eye_distance),
+        "right_brow_eye_distance": float(right_brow_eye_distance),
+
+        "left_mouth_x": float(mouth_left[0]),
+        "right_mouth_x": float(mouth_right[0]),
+        "left_mouth_y": float(mouth_left[1]),
+        "right_mouth_y": float(mouth_right[1]),
+        "mouth_width": float(mouth_width),
+
+        "left_upper_lip_y": float(upper_left[1]),
+        "right_upper_lip_y": float(upper_right[1]),
+
+        "mouth_angle_deg": float(mouth_angle),
+        "mouth_slope": float(mouth_slope),
+        "brow_angle_deg": float(brow_angle),
+    }
+
+
+# ============================================================
+# AGREGASI DAN FITUR ANTAR-GERAKAN
+# ============================================================
+
+def aggregate_measurements(
+    measurements: list[dict[str, float]],
+) -> dict[str, float]:
+    if not measurements:
+        raise ValueError("insufficient_valid_frames")
+
+    keys = measurements[0].keys()
+
+    return {
+        key: float(
+            median(
+                measurement[key]
+                for measurement in measurements
+            )
+        )
+        for key in keys
+    }
+
+
+def angle_difference(
+    active_angle: float,
+    neutral_angle: float,
+) -> float:
+    return abs(
+        normalize_line_angle(
+            active_angle - neutral_angle
+        )
+    )
+
+
+def build_movement_features(
+    aggregated: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float | str]]:
+    rest = aggregated["diam"]
+    brow = aggregated["angkat_alis"]
+    eye = aggregated["tutup_mata"]
+    smile = aggregated["senyum"]
+    # snarl = aggregated["snarl"]
+    pucker = aggregated["mencucu"]
+
+    rest_mouth_width = max(
+        rest["mouth_width"],
+        EPSILON,
+    )
+
+    # Angkat alis: jarak alis-mata seharusnya bertambah.
+    left_brow_excursion = max(
+        0.0,
+        brow["left_brow_eye_distance"]
+        - rest["left_brow_eye_distance"],
+    )
+    right_brow_excursion = max(
+        0.0,
+        brow["right_brow_eye_distance"]
+        - rest["right_brow_eye_distance"],
+    )
+
+    # Tutup mata: 1 berarti menutup penuh relatif terhadap kondisi diam.
+    left_eye_closure = float(
+        np.clip(
+            1.0
+            - eye["left_eye_aperture"]
+            / (rest["left_eye_aperture"] + EPSILON),
+            0.0,
+            1.0,
+        )
+    )
+    right_eye_closure = float(
+        np.clip(
+            1.0
+            - eye["right_eye_aperture"]
+            / (rest["right_eye_aperture"] + EPSILON),
+            0.0,
+            1.0,
+        )
+    )
+
+    # Senyum: sudut bibir bergerak ke atas relatif terhadap diam.
+    left_smile_excursion = max(
+        0.0,
+        rest["left_mouth_y"] - smile["left_mouth_y"],
+    )
+    right_smile_excursion = max(
+        0.0,
+        rest["right_mouth_y"] - smile["right_mouth_y"],
+    )
+
+    # Snarl: sisi bibir atas bergerak ke atas.
+    # Dibagi lebar mulut saat diam agar lebih stabil terhadap ukuran wajah.
+    # left_snarl_excursion = (
+    #     max(
+    #         0.0,
+    #         rest["left_upper_lip_y"]
+    #         - snarl["left_upper_lip_y"],
+    #     )
+    #     / rest_mouth_width
+    # )
+    # right_snarl_excursion = (
+    #     max(
+    #         0.0,
+    #         rest["right_upper_lip_y"]
+    #         - snarl["right_upper_lip_y"],
+    #     )
+    #     / rest_mouth_width
+    # )
+
+    # Mencucu: kedua sudut bibir bergerak menuju tengah.
+    # Perpindahan dibagi lebar mulut saat diam.
+    left_pucker_excursion = (
+        max(
+            0.0,
+            pucker["left_mouth_x"]
+            - rest["left_mouth_x"],
+        )
+        / rest_mouth_width
+    )
+    right_pucker_excursion = (
+        max(
+            0.0,
+            rest["right_mouth_x"]
+            - pucker["right_mouth_x"],
+        )
+        / rest_mouth_width
+    )
+
+    pucker_width_reduction = float(
+        np.clip(
+            1.0
+            - pucker["mouth_width"]
+            / rest_mouth_width,
+            0.0,
+            1.0,
+        )
+    )
+
+    return {
+        "rest": {
+            "eye_delta": abs(
+                rest["left_eye_aperture"]
+                - rest["right_eye_aperture"]
+            ),
+            "eye_ai": asymmetry_index(
+                rest["left_eye_aperture"],
+                rest["right_eye_aperture"],
+            ),
+            "brow_ai": asymmetry_index(
+                rest["left_brow_eye_distance"],
+                rest["right_brow_eye_distance"],
+            ),
+            "mouth_angle_deg": abs(rest["mouth_angle_deg"]),
+            "mouth_angle_signed_deg": rest["mouth_angle_deg"],
+            "mouth_slope": rest["mouth_slope"],
+        },
+
+        "angkat_alis": {
+            "left": left_brow_excursion,
+            "right": right_brow_excursion,
+            "asymmetry_index": asymmetry_index(
+                left_brow_excursion,
+                right_brow_excursion,
+                activity_floor=0.005,
+            ),
+            "angle_change_deg": angle_difference(
+                brow["brow_angle_deg"],
+                rest["brow_angle_deg"],
+            ),
+            "strength": (
+                left_brow_excursion
+                + right_brow_excursion
+            ) / 2.0,
+            "weaker_side": weaker_side(
+                left_brow_excursion,
+                right_brow_excursion,
+            ),
+        },
+
+        "tutup_mata": {
+            "left": left_eye_closure,
+            "right": right_eye_closure,
+            "asymmetry_index": asymmetry_index(
+                left_eye_closure,
+                right_eye_closure,
+                activity_floor=0.05,
+            ),
+            "minimum_closure": min(
+                left_eye_closure,
+                right_eye_closure,
+            ),
+            "strength": (
+                left_eye_closure
+                + right_eye_closure
+            ) / 2.0,
+            "weaker_side": weaker_side(
+                left_eye_closure,
+                right_eye_closure,
+            ),
+        },
+
+        "senyum": {
+            "left": left_smile_excursion,
+            "right": right_smile_excursion,
+            "asymmetry_index": asymmetry_index(
+                left_smile_excursion,
+                right_smile_excursion,
+                activity_floor=0.005,
+            ),
+            "angle_change_deg": angle_difference(
+                smile["mouth_angle_deg"],
+                rest["mouth_angle_deg"],
+            ),
+            "mouth_angle_deg": smile["mouth_angle_deg"],
+            "mouth_slope": smile["mouth_slope"],
+            "strength": (
+                left_smile_excursion
+                + right_smile_excursion
+            ) / 2.0,
+            "weaker_side": weaker_side(
+                left_smile_excursion,
+                right_smile_excursion,
+            ),
+        },
+
+        # "snarl": {
+        #     "left": left_snarl_excursion,
+        #     "right": right_snarl_excursion,
+        #     "asymmetry_index": asymmetry_index(
+        #         left_snarl_excursion,
+        #         right_snarl_excursion,
+        #         activity_floor=0.005,
+        #     ),
+        #     "strength": (
+        #         left_snarl_excursion
+        #         + right_snarl_excursion
+        #     ) / 2.0,
+        #     "max_excursion": max(
+        #         left_snarl_excursion,
+        #         right_snarl_excursion,
+        #     ),
+        #     "weaker_side": weaker_side(
+        #         left_snarl_excursion,
+        #         right_snarl_excursion,
+        #     ),
+        # },
+
+        "mencucu": {
+            "left": left_pucker_excursion,
+            "right": right_pucker_excursion,
+            "asymmetry_index": asymmetry_index(
+                left_pucker_excursion,
+                right_pucker_excursion,
+                activity_floor=0.005,
+            ),
+            "strength": (
+                left_pucker_excursion
+                + right_pucker_excursion
+            ) / 2.0,
+            "max_excursion": max(
+                left_pucker_excursion,
+                right_pucker_excursion,
+            ),
+            "width_reduction": pucker_width_reduction,
+            "weaker_side": weaker_side(
+                left_pucker_excursion,
+                right_pucker_excursion,
+            ),
+        },
+    }
+
+
+
+# ============================================================
+# PENILAIAN REGIONAL DAN RULE HOUSE-BRACKMANN
+# ============================================================
+#
+# Implementasi dipisahkan:
+# - regional_assessment.py:
+#   menerjemahkan fitur geometris menjadi kategori regional.
+# - hb_rules.py:
+#   memetakan kategori regional menjadi Tingkat I-VI.
+#
+# Grade tidak ditentukan langsung dari satu nilai asimetri.
+
+
+# ============================================================
+# ANALISIS SELURUH FRAME
+# ============================================================
+
+# Quality gate hanya untuk kegagalan teknis.
+# Gerakan kecil, mata tidak menutup, atau mulut tidak bergerak
+# tetap diterima sebagai data untuk klasifikasi.
+def analyze_detection_frames(frames: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(frames, dict):
+        return {
+            "quality_status": "invalid_frames_structure",
+        }
+
+    measurements_by_movement: dict[str, dict[str, float]] = {}
+    valid_frame_count: dict[str, int] = {}
+    rejected_frame_count: dict[str, int] = {}
+
+    for movement in REQUIRED_MOVEMENTS:
+        frame_list = frames.get(movement)
+
+        if not isinstance(frame_list, list):
+            return {
+                "quality_status": "missing_movement",
+                "movement": movement,
+            }
+
+        if len(frame_list) < MINIMUM_VALID_FRAMES:
+            return {
+                "quality_status": "insufficient_received_frames",
+                "movement": movement,
+                "received_frame_count": len(frame_list),
+            }
+
+        if len(frame_list) > MAXIMUM_FRAMES_PER_MOVEMENT:
+            return {
+                "quality_status": "too_many_frames",
+                "movement": movement,
+                "received_frame_count": len(frame_list),
+                "maximum_frame_count": MAXIMUM_FRAMES_PER_MOVEMENT,
+            }
+
+        valid_measurements: list[dict[str, float]] = []
+        rejected_count = 0
+
+        for frame_base64 in frame_list:
+            try:
+                image = decode_base64_image(frame_base64)
+
+                if image is None:
+                    rejected_count += 1
+                    continue
+
+                landmarks = detect_landmarks(image)
+
+                if landmarks is None:
+                    rejected_count += 1
+                    continue
+
+                measurement = extract_frame_geometry(
+                    landmarks,
+                    image.shape,
+                )
+
+                valid_measurements.append(measurement)
+
+            except Exception as error:
+                rejected_count += 1
+                print(
+                    f"FRAME REJECTED {movement}: {error}"
+                )
+
+        valid_frame_count[movement] = len(valid_measurements)
+        rejected_frame_count[movement] = rejected_count
+
+        if len(valid_measurements) < MINIMUM_VALID_FRAMES:
+            return {
+                "quality_status": "insufficient_valid_frames",
+                "movement": movement,
+                "valid_frame_count": valid_frame_count,
+                "rejected_frame_count": rejected_frame_count,
+            }
+
+        measurements_by_movement[movement] = aggregate_measurements(
+            valid_measurements
+        )
+
+    feature_values = build_movement_features(
+        measurements_by_movement
+    )
+
+    # Gerakan dengan excursion rendah tidak langsung ditolak karena
+    # kondisi tersebut dapat merupakan disfungsi berat, bukan sekadar
+    # pengguna tidak mengikuti instruksi. Sistem hanya memberi warning.
+    quality_warnings: list[str] = []
+
+    # snarl_feature = feature_values["snarl"]
+    pucker_feature = feature_values["mencucu"]
+
+    # if (
+    #     float(snarl_feature["max_excursion"])
+    #     < MIN_SNARL_MAX_EXCURSION
+    # ):
+    #     quality_warnings.append("snarl_low_excursion")
+
+    if (
+        float(pucker_feature["max_excursion"])
+        < MIN_PUCKER_MAX_EXCURSION
+        and float(pucker_feature["width_reduction"])
+        < MIN_PUCKER_WIDTH_REDUCTION
+    ):
+        quality_warnings.append("pucker_low_excursion")
+
+    regional_result = assess_regions(feature_values)
+    hb_result = classify_house_brackmann(regional_result)
+
+    # Persentase dihitung dari kategori regional yang sama dan
+    # hanya digunakan sebagai skor progres/monitoring.
+    face_function_score = calculate_face_function_score(
+        regional_result,
+        hb_result.get("grade"),
+    )
+
+    affected_side = infer_affected_side(regional_result)
+
+    classification_status = hb_result["status"]
+
+    result = {
+        "quality_status": "valid",
+        "classification_status": classification_status,
+        "hb_grade": hb_result["grade"],
+        "hb_roman": hb_result["roman"],
+        "hb_label": hb_result["label"],
+        "hb_matched_rule": hb_result["matched_rule"],
+        "classification_message": hb_result["message"],
+        "inconsistent_regions": hb_result.get(
+            "inconsistent_regions",
+            [],
+        ),
+        "face_function_score": face_function_score,
+        "regional_result": regional_result,
+        "feature_values": feature_values,
+        "affected_side": affected_side,
+        "algorithm_version": "single-concept-relaxed-quality-gate-v2",
+        "threshold_version": REGIONAL_ASSESSMENT_VERSION,
+        "quality_warnings": quality_warnings,
+        "valid_frame_count": valid_frame_count,
+        "rejected_frame_count": rejected_frame_count,
+        "side_reference": "image",
+    }
+
+    # Data teknis valid, tetapi pola regional tidak konsisten.
+    # Jangan paksa mengeluarkan Tingkat I-VI.
+    if classification_status == "repeat_required":
+        result["message"] = hb_result["message"]
+        result["invalid_movements"] = hb_result.get(
+            "inconsistent_regions",
+            [],
+        )
+
+    return result

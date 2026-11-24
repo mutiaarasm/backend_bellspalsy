@@ -1,24 +1,30 @@
 from flask_mail import Mail, Message
+from therapy_routes import therapy_bp
 from itsdangerous import URLSafeTimedSerializer
 from flask import Flask, request, jsonify, send_from_directory, render_template, redirect, url_for, session
-from models import ExerciseVideo, Hospital, db, User, LoginHistory, Article, MonitoringSession
 from user_agents import parse
-from models import db
 from geopy.distance import geodesic
 from functools import wraps
 from dotenv import load_dotenv
+from sqlalchemy import text
+from models import (
+    ExerciseVideo,
+    Hospital,
+    db,
+    User,
+    LoginHistory,
+    Article,
+    MonitoringSession,
+)
 
-
-from detection_service import analyze_detection_frames, save_user_progress
-from rule_based import classify_result
-from monitoring_service import (
-    get_next_session_number,
-    save_monitoring_session,
-    get_monitoring_history
+from detection_routes_hb import (
+    detection_hb_bp,
 )
 import numpy as np
 import random
 import requests
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from datetime import datetime, timedelta
 import os
 import cv2
@@ -53,6 +59,7 @@ app.config["MAIL_USE_TLS"] = os.getenv("MAIL_USE_TLS", "True") == "True"
 app.config["MAIL_USERNAME"] = os.getenv("MAIL_USERNAME")
 app.config["MAIL_PASSWORD"] = os.getenv("MAIL_PASSWORD")
 app.config["MAIL_DEFAULT_SENDER"] = os.getenv("MAIL_DEFAULT_SENDER")
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 
 
@@ -79,6 +86,8 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db.init_app(app)
 migrate = Migrate(app, db)
+app.register_blueprint(detection_hb_bp)
+app.register_blueprint(therapy_bp)
 
 @app.get("/")
 def home():
@@ -178,9 +187,19 @@ def login():
 
     user = User.query.filter_by(email=email).first()
 
-    if not user or not check_password_hash(user.password_hash, password):
-        return jsonify({"message": "email atau password salah"}), 401
-
+    if (
+        user is None
+        or not user.password_hash
+        or not check_password_hash(
+            user.password_hash,
+            password,
+        )
+    ):
+        return jsonify({
+            "message": (
+                "Email atau password salah."
+            ),
+        }), 401
     if not user.is_verified:
         return jsonify({"message": "email belum diverifikasi"}), 403
 
@@ -217,6 +236,295 @@ def login():
             "email": user.email
         }
     }), 200
+@app.post("/auth/google")
+def google_login():
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "success": False,
+            "message": "Body request harus berupa JSON.",
+        }), 400
+
+    token = str(
+        data.get("id_token", "")
+    ).strip()
+
+    if not token:
+        return jsonify({
+            "success": False,
+            "message": "Google ID token tidak tersedia.",
+        }), 400
+
+    google_web_client_id = str(
+        os.getenv(
+            "GOOGLE_WEB_CLIENT_ID",
+            "",
+        )
+    ).strip()
+
+    if not google_web_client_id:
+        return jsonify({
+            "success": False,
+            "message": (
+                "GOOGLE_WEB_CLIENT_ID belum "
+                "dikonfigurasi pada server."
+            ),
+        }), 500
+
+    try:
+        claims = (
+            google_id_token
+            .verify_oauth2_token(
+                token,
+                google_requests.Request(),
+                google_web_client_id,
+            )
+        )
+    except ValueError as error:
+        print(
+            "GOOGLE TOKEN INVALID:",
+            error,
+        )
+
+        return jsonify({
+            "success": False,
+            "message": (
+                "Token Google tidak valid "
+                "atau sudah kedaluwarsa."
+            ),
+        }), 401
+    except Exception as error:
+        print(
+            "GOOGLE VERIFICATION ERROR:",
+            error,
+        )
+
+        return jsonify({
+            "success": False,
+            "message": (
+                "Verifikasi akun Google gagal."
+            ),
+        }), 500
+
+    google_sub = str(
+        claims.get("sub", "")
+    ).strip()
+
+    email = str(
+        claims.get("email", "")
+    ).strip().lower()
+
+    name = str(
+        claims.get("name", "")
+    ).strip()
+
+    picture = str(
+        claims.get("picture", "")
+    ).strip()
+
+    email_verified = bool(
+        claims.get(
+            "email_verified",
+            False,
+        )
+    )
+
+    if not google_sub:
+        return jsonify({
+            "success": False,
+            "message": (
+                "Identitas akun Google "
+                "tidak tersedia."
+            ),
+        }), 401
+
+    if not email or not email_verified:
+        return jsonify({
+            "success": False,
+            "message": (
+                "Email Google belum "
+                "terverifikasi."
+            ),
+        }), 401
+
+    try:
+        # Prioritas pertama: cari berdasarkan identitas
+        # permanen akun Google.
+        user = User.query.filter_by(
+            google_sub=google_sub,
+        ).first()
+
+        if user is None:
+            # Jika email sudah pernah terdaftar secara lokal,
+            # hubungkan akun tersebut dengan Google.
+            user = User.query.filter_by(
+                email=email,
+            ).first()
+
+            if user is not None:
+                existing_google_sub = str(
+                    user.google_sub or ""
+                ).strip()
+
+                if (
+                    existing_google_sub
+                    and existing_google_sub
+                    != google_sub
+                ):
+                    return jsonify({
+                        "success": False,
+                        "message": (
+                            "Email ini sudah terhubung "
+                            "dengan akun Google lain."
+                        ),
+                    }), 409
+
+                user.google_sub = google_sub
+
+                # Pertahankan local jika akun masih
+                # memiliki password lokal.
+                if user.password_hash:
+                    user.auth_provider = (
+                        "local_google"
+                    )
+                else:
+                    user.auth_provider = (
+                        "google"
+                    )
+
+                user.is_verified = True
+
+                if not user.name and name:
+                    user.name = name
+
+                if (
+                    not user.avatar_url
+                    and picture
+                ):
+                    user.avatar_url = picture
+
+            else:
+                # Akun benar-benar baru dari Google.
+                user = User(
+                    name=(
+                        name
+                        or email.split("@")[0]
+                    ),
+                    email=email,
+                    password_hash=None,
+                    google_sub=google_sub,
+                    auth_provider="google",
+                    avatar_url=(
+                        picture or None
+                    ),
+                    is_verified=True,
+                    otp_code=None,
+                    otp_expired_at=None,
+                )
+
+                db.session.add(user)
+
+        else:
+            # Perbarui informasi aman dari Google.
+            user.is_verified = True
+
+            if not user.name and name:
+                user.name = name
+
+            if (
+                not user.avatar_url
+                and picture
+            ):
+                user.avatar_url = picture
+
+        # Flush agar user baru mendapatkan ID
+        # sebelum membuat login history.
+        db.session.flush()
+
+        access_token = (
+            create_access_token(
+                identity=str(user.id),
+            )
+        )
+
+        user_agent_string = (
+            request.headers.get(
+                "User-Agent",
+                "",
+            )
+        )
+
+        ua = parse(user_agent_string)
+
+        device = (
+            f"{ua.browser.family} - "
+            f"{ua.os.family}"
+        )
+
+        if "Other" in device:
+            device = "Mobile Device"
+
+        ip_address = (
+            request.headers
+            .get(
+                "X-Forwarded-For",
+                request.remote_addr,
+            )
+        )
+
+        # Jika melewati proxy/ngrok, ambil IP pertama.
+        if ip_address:
+            ip_address = (
+                ip_address
+                .split(",")[0]
+                .strip()
+            )
+
+        history = LoginHistory(
+            user_id=user.id,
+            email=user.email,
+            ip_address=ip_address,
+            device=device,
+            location=ip_address,
+            status="success",
+        )
+
+        db.session.add(history)
+        db.session.commit()
+
+        return jsonify({
+            "success": True,
+            "message": (
+                "Login dengan Google berhasil."
+            ),
+            "access_token": access_token,
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "avatar_url":
+                    user.avatar_url,
+                "auth_provider":
+                    user.auth_provider,
+            },
+        }), 200
+
+    except Exception as error:
+        db.session.rollback()
+
+        print(
+            "GOOGLE LOGIN DATABASE ERROR:",
+            error,
+        )
+
+        return jsonify({
+            "success": False,
+            "message": (
+                "Login Google gagal "
+                "disimpan ke database."
+            ),
+        }), 500
 
 @app.get("/auth/login-history")
 @jwt_required()
@@ -647,89 +955,244 @@ def add_video():
 
 import traceback
 
-@app.post("/api/detection/analyze")
-@jwt_required()
-def analyze_detection():
-    try:
-        data = request.get_json(silent=True) or {}
-        frames = data.get("frames")
+# @app.post("/api/detection/analyze")
+# @jwt_required()
+# def analyze_detection():
+#     try:
+#         data = request.get_json(
+#             silent=True,
+#         ) or {}
 
-        if not frames:
-            return jsonify({
-                "success": False,
-                "message": "Frames kosong"
-            }), 400
+#         frames = data.get("frames")
+#         mode = data.get("mode", "quick")
 
-        mode = data.get("mode", "quick")
-        user_id = int(get_jwt_identity())
+#         required_movements = {
+#             "diam",
+#             "angkat_alis",
+#             "tutup_mata",
+#             "senyum",
+#             "snarl",
+#             "mencucu",
+#         }
 
-        if len(frames) > 20:
-            return jsonify({
-            "success": False,
-            "message": "Too many frames (limit 20)"
-        }), 400
+#         if not isinstance(frames, dict):
+#             return jsonify({
+#                 "success": False,
+#                 "message": (
+#                     "Frames harus berupa objek "
+#                     "per gerakan."
+#                 ),
+#             }), 400
 
-        movement_features = analyze_detection_frames(frames)
-        result = classify_result(movement_features)
+#         missing_movements = (
+#             required_movements -
+#             set(frames.keys())
+#         )
 
-        if mode == "monitoring":
-            save_monitoring_session(user_id, result)
+#         if missing_movements:
+#             return jsonify({
+#                 "success": False,
+#                 "message": (
+#                     "Gerakan belum lengkap."
+#                 ),
+#                 "missing_movements": sorted(
+#                     missing_movements
+#                 ),
+#             }), 400
 
-            session_number = get_next_session_number(user_id) - 1
-            save_user_progress(user_id, session_number)
+#         for movement in required_movements:
+#             movement_frames = frames.get(
+#                 movement
+#             )
 
-        return jsonify({
-            "success": True,
-            "data": result
-        })
+#             if not isinstance(
+#                 movement_frames,
+#                 list,
+#             ):
+#                 return jsonify({
+#                     "success": False,
+#                     "message": (
+#                         f"Frame {movement} "
+#                         "harus berupa list."
+#                     ),
+#                 }), 400
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+#             frame_count = len(
+#                 movement_frames
+#             )
 
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+#             if frame_count < 4:
+#                 return jsonify({
+#                     "success": False,
+#                     "quality_status": (
+#                         "insufficient_valid_frames"
+#                     ),
+#                     "movement": movement,
+#                     "message": (
+#                         f"Frame {movement} "
+#                         "kurang dari 4."
+#                     ),
+#                 }), 422
 
-@app.route("/api/monitoring/history", methods=["GET"])
-@jwt_required()
-def monitoring_history():
-    try:
-        user_id = int(get_jwt_identity())
-        history = get_monitoring_history(user_id)
+#             if frame_count > 6:
+#                 return jsonify({
+#                     "success": False,
+#                     "message": (
+#                         f"Frame {movement} "
+#                         "melebihi batas 6."
+#                     ),
+#                 }), 400
+
+#         movement_features = (
+#             analyze_detection_frames(
+#                 frames
+#             )
+#         )
+
+#         if (
+#             movement_features.get(
+#                 "quality_status"
+#             ) != "valid"
+#         ):
+#             return jsonify({
+#                 "success": False,
+#                 "data": movement_features,
+#                 "message": (
+#                     "Pengambilan tidak memenuhi "
+#                     "kualitas minimum."
+#                 ),
+#             }), 422
+
+#         result = classify_result(
+#             movement_features
+#         )
+
+#         user_id = int(
+#             get_jwt_identity()
+#         )
+
+#         if mode == "monitoring":
+#             save_monitoring_session(
+#                 user_id,
+#                 result,
+#             )
+
+#             session_number = (
+#                 get_next_session_number(
+#                     user_id
+#                 ) - 1
+#             )
+
+#             save_user_progress(
+#                 user_id,
+#                 session_number,
+#             )
+
+#         return jsonify({
+#             "success": True,
+#             "data": result,
+#         }), 200
+
+#     except Exception as error:
+#         traceback.print_exc()
+
+#         return jsonify({
+#             "success": False,
+#             "error": str(error),
+#         }), 500
+
+# @app.route("/api/monitoring/history", methods=["GET"])
+# @jwt_required()
+# def monitoring_history():
+#     try:
+#         user_id = int(get_jwt_identity())
+#         history = get_monitoring_history(user_id)
         
-        # Pastikan history berbentuk list biasa, bukan objek query SQL raw
-        return jsonify({
-            "success": True, 
-            "data": history
-        }), 200
-    except Exception as e:
-        # Menampilkan error asli di terminal Flask agar kelihatan salahnya di mana
-        print(f"Error di monitoring_history: {str(e)}") 
-        return jsonify({
-            "success": False, 
-            "message": f"Terjadi kesalahan di server: {str(e)}"
-        }), 500
+#         # Pastikan history berbentuk list biasa, bukan objek query SQL raw
+#         return jsonify({
+#             "success": True, 
+#             "data": history
+#         }), 200
+#     except Exception as e:
+#         # Menampilkan error asli di terminal Flask agar kelihatan salahnya di mana
+#         print(f"Error di monitoring_history: {str(e)}") 
+#         return jsonify({
+#             "success": False, 
+#             "message": f"Terjadi kesalahan di server: {str(e)}"
+#         }), 500
     
-@app.route("/api/monitoring/reset", methods=["DELETE"])
-@jwt_required()
-def reset_monitoring():
-    user_id = int(get_jwt_identity())
-    MonitoringSession.query.filter_by(user_id=user_id).delete()
-    db.session.commit()
-    return jsonify({"success": True, "message": "Monitoring program reset successfully"})
+# @app.route("/api/monitoring/reset", methods=["DELETE"])
+# @jwt_required()
+# def reset_monitoring():
+#     try:
+#         user_id = int(get_jwt_identity())
 
-@app.route("/api/monitoring/repeat", methods=["POST"])
-@jwt_required()
-def repeat_monitoring():
-    user_id = int(get_jwt_identity())
+#         # Hapus hasil deteksi monitoring 7 sesi
+#         deleted_sessions = (
+#             MonitoringSession.query
+#             .filter_by(user_id=user_id)
+#             .delete(synchronize_session=False)
+#         )
 
-    # Hapus semua session lama user
-    MonitoringSession.query.filter_by(user_id=user_id).delete()
-    db.session.commit()
+#         # Hapus penanda progress terapi milik user
+#         deleted_progress = db.session.execute(
+#             text(
+#                 """
+#                 DELETE FROM user_progress
+#                 WHERE user_id = :user_id
+#                 """
+#             ),
+#             {"user_id": user_id},
+#         ).rowcount
 
-    return jsonify({"success": True, "message": "Monitoring session reset, ready to repeat"})
+#         db.session.commit()
+
+#         # Pemeriksaan setelah reset
+#         remaining_sessions = (
+#             MonitoringSession.query
+#             .filter_by(user_id=user_id)
+#             .count()
+#         )
+
+#         remaining_progress = db.session.execute(
+#             text(
+#                 """
+#                 SELECT COUNT(*) AS total
+#                 FROM user_progress
+#                 WHERE user_id = :user_id
+#                 """
+#             ),
+#             {"user_id": user_id},
+#         ).scalar()
+
+#         print("===== RESET MONITORING =====")
+#         print(f"User ID             : {user_id}")
+#         print(f"Monitoring dihapus  : {deleted_sessions}")
+#         print(f"Progress dihapus    : {deleted_progress}")
+#         print(f"Monitoring tersisa  : {remaining_sessions}")
+#         print(f"Progress tersisa    : {remaining_progress}")
+
+#         return jsonify({
+#             "success": True,
+#             "message": "Monitoring program successfully reset",
+#             "data": {
+#                 "deleted_monitoring_sessions": deleted_sessions,
+#                 "deleted_user_progress": deleted_progress,
+#                 "remaining_monitoring_sessions": remaining_sessions,
+#                 "remaining_user_progress": remaining_progress,
+#             }
+#         }), 200
+
+#     except Exception as e:
+#         db.session.rollback()
+
+#         print(f"Reset monitoring error: {e}")
+
+#         return jsonify({
+#             "success": False,
+#             "message": "Failed to reset monitoring program",
+#             "error": str(e),
+#         }), 500
     
 @app.route('/api/nearby-healthcare', methods=['GET'])
 def nearby_healthcare():
